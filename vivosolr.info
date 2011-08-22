@@ -1,0 +1,11 @@
+name = VIVO Solr Search Integration
+description = Searches Solr indexes created by the VIVO Linked Data Index Builder
+dependencies[] = search
+dependencies[] = apachesolr
+package = Search
+core = 7.x
+version = 7.x-1.0-alpha1
+
+files[] = plugins/facetapi/adapter.inc
+files[] = plugins/facetapi/query_type_vivo.inc
+files[] = plugins/facetapi/widget_visual_links.inc

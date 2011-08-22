@@ -1,0 +1,543 @@
+<?php
+@include_once('vivosolr.facet.inc');
+
+/**
+ * @file
+ *  Integration with core Drupal search and the Apache Solr module.
+ */
+
+// Solr schema configuration
+define('VIVOSOLR_FIELD_URI', 'URI');
+define('VIVOSOLR_FIELD_CLASSGROUP', 'classgroup_label');
+define('VIVOSOLR_FIELD_CLASS', 'class_label');
+define('VIVOSOLR_FIELD_INSTITUTION', 'site_name');
+define('VIVOSOLR_FIELD_BODYTEXT', 'alltext');
+define('VIVOSOLR_FIELD_BODYTEXT_STEMMED', 'alltext');
+define('VIVOSOLR_FIELD_NAME', 'name');
+define('VIVOSOLR_FIELD_MONIKER', 'title');
+define('VIVOSOLR_DEFAULT_Q', '');
+define('VIVOSOLR_SEARCH_URL', 'search/vivo');
+
+/**
+ * Implements hook_menu().
+ */
+function vivosolr_menu() {
+  $items = array();
+  $items['admin/config/search/vivosolr'] = array(
+    'title'              => 'VIVO search',
+    'description'        => 'Administer VIVO search configuration.',
+    'page callback'      => 'drupal_get_form',
+    'page arguments'     => array('vivosolr_settings_form'),
+    'access arguments'   => array('administer search'),
+    'file'               => 'vivosolr.admin.inc',
+  );
+  $items['admin/config/search/vivosolr/settings'] = array(
+    'title'              => 'Settings',
+    'access arguments'   => array('administer search'),
+    'weight'             => -10,
+    'file'               => 'vivosolr.admin.inc',
+    'type'               => MENU_DEFAULT_LOCAL_TASK,
+  );
+  $items['admin/config/search/vivosolr/statistics'] = array(
+    'title'              => 'Index statistics',
+    'page callback'      => 'vivosolr_statistics_page',
+    'access arguments'   => array('administer search'),
+    'weight'             => -5,
+    'file'               => 'vivosolr.admin.inc',
+    'type'               => MENU_LOCAL_TASK,
+  );
+
+  // Add Facet API forms to our admin section.
+  // @see apachesolr_menu()
+
+  if (module_exists('facetapi')) {
+    $file_path = drupal_get_path('module', 'facetapi');
+    $base_path = 'admin/config/search/vivosolr';
+    $first = TRUE;
+    foreach (facetapi_get_realm_info() as $realm_name => $realm) {
+      if ($first) {
+        $first = FALSE;
+        $items[$base_path . '/facets'] = array(
+          'title'            => 'Facets',
+          'page callback'    => 'vivosolr_facets_page',
+          'page arguments'   =>  array($realm_name),
+          'weight'           => -7,
+          'access arguments' => array('administer search'),
+          'file path'        => $file_path,
+          'file'             => 'facetapi.admin.inc',
+          'type'             => MENU_LOCAL_TASK,
+          'context'          => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+        );
+        $items[$base_path . '/facets/' . $realm_name] = array(
+          'title'            => $realm['label'],
+          'type'             => MENU_DEFAULT_LOCAL_TASK,
+          'weight'           => $realm['weight'],
+        );
+      }
+      else {
+        $items[$base_path . '/facets/' . $realm_name] = array(
+          'title'            => $realm['label'],
+          'page callback'    => 'vivosolr_facets_page',
+          'page arguments'   => array($realm_name),
+          'access arguments' => array('administer search'),
+          'type'             => MENU_LOCAL_TASK,
+          'context'          => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+          'file path'        => $file_path,
+          'file'             => 'facetapi.admin.inc',
+        );
+      }
+    }
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_search_info().
+ */
+function vivosolr_search_info() {
+  return variable_get('vivosolr_search_info', array(
+    'title' => 'VIVO',
+    'path' => 'vivo',
+    'conditions_callback' => 'vivosolr_conditions',
+  ));
+}
+
+/**
+ * Implements hook_search_execute().
+ */
+function vivosolr_search_execute($keys = NULL, $conditions = NULL) {
+  $filters = isset($conditions['fq']) ? $conditions['fq'] : array();
+  $solrsort = isset($_GET['solrsort']) ? $_GET['solrsort'] : '';
+  $empty_search_behavior = isset($conditions['vivosolr_browse']) ? $conditions['vivosolr_browse'] : '';
+  unset($conditions['vivosolr_browse']);
+
+  $results = '';
+  try {
+    if (!$keys && !$conditions && ($empty_search_behavior == 'browse' || $empty_search_behavior == 'blocks')) {
+      vivosolr_run_empty('vivosolr', 'search/' . arg(1));
+      $results['vivosolr_browse'] = $empty_search_behavior;
+      if ($empty_search_behavior == 'browse') {
+        apachesolr_suppress_blocks(TRUE);
+      }
+    }
+    else {
+      $results = vivosolr_run('vivosolr', array('q' => $keys, 'fq' => $filters), $solrsort, 'search/' . arg(1), pager_find_page());
+    }
+    return $results;
+  }
+  catch (Exception $e) {
+    watchdog('VIVO search / Apache Solr', nl2br(check_plain($e->getMessage())), NULL, WATCHDOG_ERROR);
+    vivosolr_failure();
+  }
+}
+
+/**
+ * Implements a search_view() conditions callback.
+ */
+function vivosolr_conditions() {
+  $conditions = array();
+
+  if (!empty($_GET['fq']) && is_array($_GET['fq'])) {
+    $conditions['fq'] = $_GET['fq'];
+  }
+  // We may also have filters added by facet API module. The 'f'
+  // is determined by constant FacetapiAdapter::FILTER_KEY. Hard
+  // coded here to avoid extra class loading.
+  if (!empty($_GET['f']) && is_array($_GET['f'])) {
+    if (module_exists('facetapi')) {
+      $conditions['f'] = $_GET['f'];
+    }
+  }
+  if (variable_get('vivosolr_browse', 'blocks') != 'none') {
+    $conditions['vivosolr_browse'] = variable_get('vivosolr_browse', 'blocks');
+  }
+  return $conditions;
+}
+
+/**
+ * Wrapper for facetapi settings forms.
+ */
+function vivosolr_facets_page($realm_name) {
+  $page = array();
+  $page['settings'] = drupal_get_form('facetapi_realm_settings_form', 'vivosolr@default', $realm_name);
+  return $page;
+}
+
+/**
+ * Implements hook_search_page().
+ */
+function vivosolr_search_page($results) {
+  if (!empty($results['vivosolr_browse'])) {
+    $output = vivosolr_page_browse($results['vivosolr_browse']);
+  }
+  elseif ($results) {
+    $output = array(
+      '#theme' => 'search_results',
+      '#results' => $results,
+      '#module' => 'vivosolr',
+    );
+  }
+  else {
+    // Give the user some custom help text.
+    $output = array('#markup' => theme('vivosolr_noresults'));
+  }
+  return $output;
+}
+
+/**
+ * Handle browse results for empty searches.
+ */
+function vivosolr_page_browse($empty_search_behavior) {
+  $build = array();
+
+  // Switch in case we come up with new flags.
+  switch ($empty_search_behavior) {
+    case 'browse':
+      if (module_exists('facetapi') && $query = apachesolr_current_query()) {
+        module_load_include('inc', 'facetapi', 'facetapi.block');
+        // Get facet render elements.
+        $searcher = $query->getSearcher();
+        $elements = facetapi_build_realm($searcher, 'block');
+        $build = array();
+
+        foreach (element_children($elements) as $key) {
+          $delta = "facetapi_{$key}";
+          // @todo: order/filter these pseudo-blocks according to block.module weight, visibility (see 7.x-1beta4)
+          $block = new stdClass();
+          $block->visibility = TRUE;
+          $block->enabled = TRUE;
+          $block->module = 'facetapi';
+          $block->subject = check_plain($elements[$key]['#title']);
+          $build[$delta] = $elements[$key];
+          $block->region = NULL;
+          $block->delta = 'vivosolr-' . $key;
+          // @todo: the final themed block's div id attribute does not coincide with "real" block's id (see facetapi_get_delta_map())
+          $build[$delta]['#block'] = $block;
+          $build[$delta]['#theme_wrappers'][] = 'block';
+          $build['#sorted'] = TRUE;
+        }
+        $build['#theme_wrappers'][] = 'vivosolr_browse_blocks';
+      }
+      break;
+  }
+  return $build;
+}
+
+/**
+ * Execute a search with zero results rows so as to populate facets.
+ */
+function vivosolr_run_empty($name, $base_path = '') {
+  $solr = vivosolr_get_solr();
+  $query = apachesolr_drupal_query($name, array(), '', $base_path, $solr);
+  $query->addParam('rows', '0');
+  list($final_query, $response) = apachesolr_do_query($query, 0);
+  apachesolr_has_searched(TRUE);
+}
+
+/**
+ * Execute a search results based on keyword, filter, and sort strings.
+ *
+ * @see apachesolr_search_run().
+ */
+function vivosolr_run($name, array $params = array(), $solrsort = '', $base_path = '', $page = 0, $solr = NULL) {
+  $solr = vivosolr_get_solr();
+
+  $query = apachesolr_drupal_query($name, $params, $solrsort, $base_path, $solr);
+
+  drupal_alter('vivosolr_query', $query);
+
+  vivosolr_basic_params($query);
+
+  if ($query->getParam('q')) {
+    vivosolr_highlighting_params($query);
+    vivosolr_add_spellcheck_params($query);
+  }
+  
+  list($final_query, $response) = apachesolr_do_query($query, $page);
+  apachesolr_has_searched(TRUE);
+
+  return vivosolr_process_response($response, $final_query);
+}
+
+/**
+ * Loads and caches a Solr object.
+ *
+ * Need to use this instead of apachesolr_get_solr() because
+ * that function uses environments defined by apachesolr.module
+ */
+function vivosolr_get_solr($id = 'default') {
+  $solr_cache = &drupal_static(__FUNCTION__);
+
+  if (empty($solr_cache[$id])) {
+    $class = variable_get('apachesolr_service_class', 'DrupalApacheSolrService');
+    $url = variable_get('vivosolr_solr_url', NULL);
+    $solr = new $class($url, $id);
+    $solr_cache[$id] = $solr;
+  }
+  return $solr_cache[$id];
+}
+
+function vivosolr_failure($type = '') {
+  switch ($type) {
+    default:
+      drupal_set_message(t('Sorry, we\'re having some technical issues at the moment and should be up and running again in a few minutes.'), 'error');
+  }
+}
+
+/**
+ * Adds VIVO-specific fields as query parameters.
+ */
+function vivosolr_basic_params(DrupalSolrQueryInterface $query = NULL) {
+  $params = array(
+    'fl' => array(VIVOSOLR_FIELD_URI, VIVOSOLR_FIELD_MONIKER, VIVOSOLR_FIELD_NAME, VIVOSOLR_FIELD_INSTITUTION),
+    'rows' => variable_get('vivosolr_rows', 10),
+  );
+  if ($query) {
+    $query->addParams($params);
+  }
+  return $params;
+}
+
+/**
+ * Adds highlighting settings to the search params.
+ */
+function vivosolr_highlighting_params(DrupalSolrQueryInterface $query = NULL) {
+  $params['hl'] = variable_get('vivosolr_hl_active', 'true');
+  $params['hl.fragsize']= variable_get('vivosolr_hl_textsnippetlength', 150);
+  $params['hl.simple.pre'] = variable_get('vivosolr_hl_pretag', NULL);
+  $params['hl.simple.post'] = variable_get('vivosolr_hl_posttag', NULL);
+  $params['hl.snippets'] = variable_get('vivosolr_hl_numsnippets', 1);
+
+  $params['hl.fl'] = array(VIVOSOLR_FIELD_BODYTEXT, VIVOSOLR_FIELD_NAME);
+  $params['f.' . VIVOSOLR_FIELD_NAME . '.hl.fragsize'] = 10000;
+  $params['f.' . VIVOSOLR_FIELD_NAME . '.hl.snippets'] = 1;
+
+  $params = array_filter($params);
+  if ($query) {
+    $query->addParams($params);
+  }
+  return $params;
+}
+
+/**
+ * Adds params to return spelling suggestions.
+ */
+function vivosolr_add_spellcheck_params(DrupalSolrQueryInterface $query) {
+  $params = array();
+  if (variable_get('vivosolr_spellcheck', TRUE)) {
+    $params['spellcheck.q'] = $query->getParam('q');
+    $params['spellcheck'] = 'true';
+  }
+  $query->addParams($params);
+}
+
+function vivosolr_process_response($response, DrupalSolrQueryInterface $query) {
+  $results = array();
+  $snippet_field = VIVOSOLR_FIELD_BODYTEXT;
+
+  $total = $response->response->numFound;
+  pager_default_initialize($total, $query->getParam('rows'));
+
+  if ($total > 0) {
+
+    foreach ($response->response->docs as $doc) {
+      // Start with an empty snippets array.
+      $snippets = array();
+
+      // Gather snippets.
+      if (isset($response->highlighting->{$doc->{VIVOSOLR_FIELD_URI}}->$snippet_field )) {
+        $doc_highlights = $response->highlighting->{$doc->{VIVOSOLR_FIELD_URI}};
+        foreach ($doc_highlights->$snippet_field  as $values) {
+          $snippets[] = $values;
+        }
+      }
+
+      $snippet = theme('vivosolr_snippets', array('doc' => $doc, 'snippets' => $snippets));
+
+      if (!isset($doc->content)) {
+        $doc->content = $snippet;
+      }
+
+      $extra = array();
+
+      // Allow modules to alter each document and its extra information.
+      drupal_alter('vivosolr_result', $doc, $extra);
+
+      $fields = (array) $doc;
+
+      $result = array(
+        'link' => url($doc->{VIVOSOLR_FIELD_URI}, array('absolute' => TRUE)),
+        // template_preprocess_search_result() runs check_plain() on the title
+        // again.  Decode to correct the display.
+        'title' => htmlspecialchars_decode($doc->{VIVOSOLR_FIELD_NAME}, ENT_QUOTES),
+        'moniker' => !empty($doc->{VIVOSOLR_FIELD_MONIKER}) ? $doc->{VIVOSOLR_FIELD_MONIKER} : '',
+        'institution' => !empty($doc->{VIVOSOLR_FIELD_INSTITUTION}) ? $doc->{VIVOSOLR_FIELD_INSTITUTION} : '',
+        'snippet' => $snippet,
+        'fields' => $fields,
+      );
+
+      if (!empty($response->highlighting->{$doc->{VIVOSOLR_FIELD_URI}}->{VIVOSOLR_FIELD_NAME})) {
+        $highlight = $response->highlighting->{$doc->{VIVOSOLR_FIELD_URI}}->{VIVOSOLR_FIELD_NAME};
+        $highlight = is_array($highlight) ? reset($highlight) : $highlight;
+        $result['title_highlighted'] = !empty($highlight) ? filter_xss(htmlspecialchars_decode($highlight)) : '';
+      }
+
+      $result['extra'] = $extra;
+      $results[] = $result;
+    }
+
+    // Hook to allow modifications of the retrieved results
+    foreach (module_implements('apachesolr_process_results') as $module) {
+      $function = $module . '_apachesolr_process_results';
+      $function($results);
+    }
+  }
+  else {
+    apachesolr_suppress_blocks(TRUE);
+  }
+  return $results;
+}
+
+function vivosolr_preprocess_search_results(&$variables) {
+  if ($variables['module'] == 'vivosolr') {
+    $query = apachesolr_current_query();
+    if ($query) {
+      $variables['query'] = $query;
+      $variables['response'] = apachesolr_static_response_cache($query->getSearcher());
+    }
+    if (empty($variables['response'])) {
+      $variables['description'] = '';
+      return;
+    }
+    $total = $variables['response']->response->numFound;
+    $params = $variables['query']->getParams();
+
+    $variables['description'] = t('Showing items @start through @end of @total.', array(
+      '@start' => $params['start'] + 1,
+      '@end' => $params['start'] + $params['rows'] - 1,
+      '@total' => $total,
+    ));
+  }
+}
+
+function vivosolr_preprocess_search_result(&$variables) {
+  if ($variables['module'] == 'vivosolr') {
+    
+    // By default, add the individual's title as the title suffix.
+    $subtitle = empty($variables['result']['moniker']) ? array() : array(
+      '#prefix' => '<p class="search-subtitle"><em>',
+      '#markup' => $variables['result']['moniker'],
+      '#suffix' => '</em></p>',
+    );
+    $variables['title_suffix'] = array($subtitle);
+    
+    // By default, add the institution name to the info area.
+    $institution = array(
+      '#prefix' => '<p class="search-institution"><em>',
+      '#markup' => $variables['result']['institution'],
+      '#suffix' => '</em></p>',
+    );
+    $variables['info'] = drupal_render($institution);
+  }
+}
+
+/**
+ * Implements hook_form_[form_id]_alter().
+ *
+ * This adds spelling suggestions, retain filters to the search form.
+ */
+function vivosolr_form_search_form_alter(&$form, $form_state) {
+  if ($form['module']['#value'] == 'vivosolr') {
+    $form['#submit'][] = 'vivosolr_form_search_submit';
+    // No other modification make sense unless a query is active.
+    // Note - this means that the query must always be run before
+    // calling drupal_get_form('search_form').
+    $apachesolr_has_searched = apachesolr_has_searched();
+
+    $searcher = NULL;
+    $fq = NULL;
+    if ($apachesolr_has_searched) {
+      $query = apachesolr_current_query();
+      $searcher = $query->getSearcher();
+      // We use the presence of filter query params as a flag for the retain filters checkbox.
+      $fq = $query->getParam('fq');
+    }
+    
+    $form['basic']['vivosolr']['#tree'] = TRUE;
+    $form['basic']['vivosolr']['get'] = array(
+      '#type' => 'hidden',
+      '#default_value' => json_encode(array_diff_key($_GET, array('q' => 1, 'page' => 1, 'solrsort' => 1, 'retain-filters' => 1))),
+    );
+
+    if ($fq || isset($form_state['input']['vivosolr']['retain-filters'])) {
+      $form['basic']['vivosolr']['retain-filters'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Retain current filters'),
+        '#default_value' => (int) isset($_GET['retain-filters']),
+      );
+    }
+
+    if (variable_get('vivosolr_spellcheck', FALSE) && $apachesolr_has_searched && ($response = apachesolr_static_response_cache($searcher))) {
+      // Get spellchecker suggestions into an array.
+      if (isset($response->spellcheck->suggestions) && $response->spellcheck->suggestions) {
+        $suggestions = get_object_vars($response->spellcheck->suggestions);
+        if ($suggestions) {
+          // Get the original query and replace words.
+
+          foreach ($suggestions as $word => $value) {
+            $replacements[$word] = $value->suggestion[0];
+          }
+          $new_keywords = strtr($query->getParam('q'), $replacements);
+
+          // Show only if suggestion is different than current query.
+          if ($query->getParam('q') != $new_keywords) {
+            $form['vivosolr']['suggestion'] = array(
+              '#theme' => 'vivosolr_suggestions',
+              '#links' => array(l($new_keywords, $query->getPath($new_keywords))),
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Added form submit function to retain filters.
+ *
+ * @see vivosolr_form_search_form_alter()
+ */
+function vivosolr_form_search_submit($form, &$form_state) {
+  $fv = $form_state['values'];
+  $get = json_decode($fv['vivosolr']['get'], TRUE);
+  if (!empty($fv['vivosolr']['retain-filters'])) {
+    $get['retain-filters'] = '1';
+    // Add the query values into the redirect.
+    $form_state['redirect'] = array($form_state['redirect'], array('query' => $get));
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function vivosolr_theme() {
+  return array(
+    'vivosolr_browse_blocks' => array(
+      'render element' => 'content',
+      'file' => 'vivosolr.theme.inc',
+    ),
+    'vivosolr_snippets' => array(
+      'variables' => array('doc' => NULL, 'snippets' => array()),
+      'file' => 'vivosolr.theme.inc',
+    ),
+    'vivosolr_noresults' => array(
+      'variables' => array(),
+      'file' => 'vivosolr.theme.inc',
+    ),
+    'vivosolr_suggestions' => array(
+      'variables' => array('links' => NULL),
+      'file' => 'vivosolr.theme.inc',
+    ),
+  );
+}

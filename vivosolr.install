@@ -1,0 +1,27 @@
+<?php
+
+/**
+ * @file
+ *  Install and enable hooks
+ */
+
+/**
+ * Implements hook_enable().
+ */
+function vivosolr_enable() {
+  $active = variable_get('search_active_modules', array('node', 'user'));
+  $active[] = 'vivosolr';
+  variable_set('search_active_modules', array_unique($active));
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function vivosolr_uninstall() {
+  $active = variable_get('search_active_modules', array('node', 'user'));
+  $idx = array_search('vivosolr', $active);
+  if ($idx !== FALSE) {
+    unset($active[$idx]);
+    variable_set('search_active_modules', $active);
+  }
+}

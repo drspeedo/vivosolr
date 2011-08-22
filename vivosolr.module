@@ -4,6 +4,8 @@
 /**
  * @file
  *  Integration with core Drupal search and the Apache Solr module.
+ *
+ *  Much of this module was derived from apachesolr_search.module
  */
 
 // Solr schema configuration
@@ -37,14 +39,6 @@ function vivosolr_menu() {
     'weight'             => -10,
     'file'               => 'vivosolr.admin.inc',
     'type'               => MENU_DEFAULT_LOCAL_TASK,
-  );
-  $items['admin/config/search/vivosolr/statistics'] = array(
-    'title'              => 'Index statistics',
-    'page callback'      => 'vivosolr_statistics_page',
-    'access arguments'   => array('administer search'),
-    'weight'             => -5,
-    'file'               => 'vivosolr.admin.inc',
-    'type'               => MENU_LOCAL_TASK,
   );
 
   // Add Facet API forms to our admin section.

@@ -7,6 +7,10 @@
 
 /**
  * Widget that renders facets as a list of clickable links.
+ *
+ * The actual rendering happens in a facetapi theme function. 
+ * What we're doing here is adding the result count and 
+ * max count to the render array.
  */
 class VivosolrVisualLinksWidget extends FacetapiWidgetLinks {
 
